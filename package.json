@@ -26,7 +26,8 @@
     "index:knowledge": "tsx scripts/index-knowledge.ts",
     "verify:qdrant-idempotency": "tsx scripts/verify-qdrant-idempotency.ts",
     "search:knowledge": "tsx scripts/search-knowledge.ts",
-    "evaluate:retrieval": "tsx scripts/evaluate-retrieval.ts"
+    "evaluate:retrieval": "tsx scripts/evaluate-retrieval.ts",
+    "ask:knowledge": "tsx scripts/ask-knowledge.ts"
   },
   "dependencies": {
     "@google/genai": "^2.22.0",
