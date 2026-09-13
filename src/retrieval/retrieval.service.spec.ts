@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { EmbeddingService } from '../embedding/embedding.service.js';
+import type { MetricsService } from '../metrics/metrics.service.js';
 import type {
   KnowledgeCollectionInfo,
   KnowledgeSearchOptions,
@@ -7,6 +8,14 @@ import type {
   KnowledgeStore,
 } from '../qdrant/knowledge-store.interface.js';
 import { RetrievalService } from './retrieval.service.js';
+
+class FakeMetricsService {
+  retrievalCalls: Array<{ durationSeconds: number; resultCount: number }> = [];
+
+  recordRetrieval(params: { durationSeconds: number; resultCount: number }): void {
+    this.retrievalCalls.push(params);
+  }
+}
 
 class FakeEmbeddingService {
   dimensions = 768;
@@ -59,10 +68,12 @@ function makeResult(overrides: Partial<KnowledgeSearchResult['payload']> = {}, s
 
 describe('RetrievalService', () => {
   function makeService(store: FakeKnowledgeStore, embedding: FakeEmbeddingService = new FakeEmbeddingService()) {
+    const metrics = new FakeMetricsService();
     return {
-      service: new RetrievalService(embedding as unknown as EmbeddingService, store),
+      service: new RetrievalService(embedding as unknown as EmbeddingService, store, metrics as unknown as MetricsService),
       embedding,
       store,
+      metrics,
     };
   }
 
@@ -211,5 +222,38 @@ describe('RetrievalService', () => {
     const results = await service.search('completely unrelated query');
 
     expect(results).toEqual([]);
+  });
+
+  it('records retrieval duration and the number of results found', async () => {
+    const store = new FakeKnowledgeStore();
+    store.searchResults = [makeResult({ chunkId: 'a' }), makeResult({ chunkId: 'b' })];
+    const { service, metrics } = makeService(store);
+
+    await service.search('How much is the security deposit?');
+
+    expect(metrics.retrievalCalls).toHaveLength(1);
+    expect(metrics.retrievalCalls[0].resultCount).toBe(2);
+    expect(metrics.retrievalCalls[0].durationSeconds).toBeGreaterThanOrEqual(0);
+  });
+
+  it('records a result count of 0 when nothing is retrieved', async () => {
+    const store = new FakeKnowledgeStore();
+    store.searchResults = [];
+    const { service, metrics } = makeService(store);
+
+    await service.search('completely unrelated query');
+
+    expect(metrics.retrievalCalls[0].resultCount).toBe(0);
+  });
+
+  it('does not record a metric if the knowledge store search throws', async () => {
+    const store = new FakeKnowledgeStore();
+    store.search = async () => {
+      throw new Error('Qdrant unreachable');
+    };
+    const { service, metrics } = makeService(store);
+
+    await expect(service.search('deposit')).rejects.toThrow('Qdrant unreachable');
+    expect(metrics.retrievalCalls).toHaveLength(0);
   });
 });

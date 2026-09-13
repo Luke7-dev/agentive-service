@@ -1,0 +1,14 @@
+# Auto-loads any dashboard JSON files placed in monitoring/grafana/dashboards/
+# so the "Agentive Service" dashboard is already there on first login.
+apiVersion: 1
+
+providers:
+  - name: 'Agentive Service'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards

@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import { MetricsService } from '../metrics/metrics.service.js';
 import type { RetrievedKnowledgeChunk, SearchOptions } from '../retrieval/retrieval.interface.js';
 import { RetrievalService } from '../retrieval/retrieval.service.js';
 import type { RagAnswer, RagSource } from './rag.interface.js';
@@ -43,9 +44,12 @@ export class RagService {
   constructor(
     private readonly retrievalService: RetrievalService,
     @Inject(TEXT_GENERATION_PROVIDER) private readonly generationProvider: TextGenerationProvider,
+    private readonly metricsService: MetricsService,
   ) {}
 
   async answer(question: string, options: SearchOptions = {}): Promise<RagAnswer> {
+    this.metricsService.recordRagRequest();
+
     const chunks = await this.retrievalService.search(question, {
       limit: options.limit ?? DEFAULT_TOP_K,
       scoreThreshold: options.scoreThreshold,
@@ -68,6 +72,7 @@ export class RagService {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.warn(`Text generation failed, falling back to retrieved chunks: ${message}`);
+      this.metricsService.recordFallback();
       return { answer: this.buildFallbackAnswer(chunks), sources };
     }
   }

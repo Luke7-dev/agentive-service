@@ -1,0 +1,12 @@
+# Auto-provisions the Prometheus datasource so a developer never has to add
+# it by hand, including after `docker compose down && docker compose up -d`.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

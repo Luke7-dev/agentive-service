@@ -230,6 +230,7 @@ Building that agent well requires it to ground its answers in the business's rea
 - Graceful fallback: if Gemini generation fails, `RagService` returns the already-retrieved knowledge chunks directly instead of an error, keeping the same `{ answer, sources }` shape (see [Graceful Fallback](#graceful-fallback))
 - A stateless HTTP chat endpoint (`POST /chats`) exposing `RagService` to callers
 - A simple Next.js chat frontend (`chat/`, sibling to this service) that calls that endpoint
+- Local observability: OpenTelemetry metrics scraped by Prometheus and visualized in Grafana — see [§13](#13-observability--monitoring)
 
 ### What does not exist yet
 
@@ -616,7 +617,13 @@ flowchart TD
 
 ```
 agentive-service/
-├── docker-compose.yml          # local Qdrant (no auth, dev only)
+├── docker-compose.yml          # local Qdrant + Prometheus + Grafana (no auth, dev only)
+├── monitoring/                  # Prometheus + Grafana config — see §13
+│   ├── prometheus/prometheus.yml
+│   └── grafana/
+│       ├── provisioning/datasources/datasource.yml   # auto-adds the Prometheus datasource
+│       ├── provisioning/dashboards/dashboards.yml     # tells Grafana to load dashboards/*.json
+│       └── dashboards/agentive-service.json           # the pre-built dashboard
 ├── .env.example                 # documented environment variables (no real secrets)
 ├── car-rental-services.pdf      # knowledge source document
 ├── car-rental-policies.pdf      # knowledge source document
@@ -663,12 +670,19 @@ agentive-service/
 │   │   ├── rag.interface.ts                       # RagAnswer, RagSource
 │   │   ├── rag.constants.ts                       # TEXT_GENERATION_PROVIDER DI token
 │   │   └── rag.module.ts
-│   └── chats/
-│       ├── chats.controller.ts        # POST /chats → RagService.answer()
-│       ├── chats.controller.spec.ts
-│       ├── chats.module.ts
-│       └── dto/
-│           └── create-chat.dto.ts     # CreateChatDto + manual request validation
+│   ├── chats/
+│   │   ├── chats.controller.ts        # POST /chats → RagService.answer()
+│   │   ├── chats.controller.spec.ts
+│   │   ├── chats.module.ts
+│   │   └── dto/
+│   │       └── create-chat.dto.ts     # CreateChatDto + manual request validation
+│   └── metrics/                        # observability — see §13, isolated from business logic
+│       ├── metrics.service.ts            # the only file that knows OpenTelemetry/Prometheus specifics
+│       ├── metrics.module.ts             # wires MeterProvider + PrometheusExporter via Nest DI
+│       ├── metrics.controller.ts         # GET /metrics
+│       ├── metrics.constants.ts          # METER_PROVIDER / PROMETHEUS_EXPORTER DI tokens
+│       ├── http-metrics.interceptor.ts   # global interceptor: http_requests_total / duration
+│       └── gemini-error-classifier.ts    # pure function: error → quota/server/network/timeout/unknown
 └── test/
     ├── app.e2e-spec.ts            # e2e boot test for the default endpoint
     └── chats.e2e-spec.ts          # e2e test for POST /chats (RagService mocked)
@@ -709,7 +723,7 @@ Environment variables, as declared in `.env.example` and read in code:
 | `GEMINI_GENERATION_MODEL` | No | `gemini-3.6-flash` | `GeminiTextGenerationProvider` |
 | `QDRANT_URL` | No | `http://localhost:6333` | `QdrantKnowledgeStoreService` |
 | `QDRANT_COLLECTION` | No | `car_rental_knowledge` | `QdrantKnowledgeStoreService` |
-| `PORT` | No | `3000` | `src/main.ts` (default Nest HTTP listener, unrelated to the pipeline above) |
+| `PORT` | No | `3000` | `src/main.ts` (default Nest HTTP listener). If you change this, also update `monitoring/prometheus/prometheus.yml`'s scrape target — see [§13](#13-observability--monitoring). |
 | `FRONTEND_URL` | No | `http://localhost:8000` | `src/main.ts` — the single origin allowed via CORS to call `POST /chats` |
 
 Copy `.env.example` to `.env` and fill in `GEMINI_API_KEY` before running any script that talks to Gemini or Qdrant. `.env` is git-ignored.
@@ -726,11 +740,12 @@ Copy `chat/.env.example` to `chat/.env.local` to override it (e.g. when the back
 
 All commands below are the actual scripts defined in `package.json`, run from `agentive-service/`.
 
-**Local Qdrant (Docker):**
+**Local Docker stack (Qdrant + Prometheus + Grafana):**
 ```bash
-docker compose up -d      # start Qdrant (REST :6333, gRPC :6334)
-docker compose down       # stop it
+docker compose up -d      # start Qdrant (:6333/:6334), Prometheus (:9090), Grafana (:3002)
+docker compose down       # stop all three
 ```
+See [§13](#13-observability--monitoring) for the Prometheus/Grafana URLs and how to read them.
 
 **Knowledge pipeline:**
 ```bash
@@ -826,6 +841,7 @@ The one exception to "no HTTP API surface" is `POST /chats` (§3.2/§3.5) — a 
 | 3.2 | Chat HTTP API (`POST /chats`) + simple Next.js chat frontend | **Implemented** (Step 3.2 — stateless, no auth, no persistence) |
 | 3.3 | Customer scenario E2E evaluation (Cypress, real pipeline, no mocking) | **Implemented** (Step 3.3 — 10 scenarios; 3/10 verified passing this session, remainder blocked by Gemini free-tier daily quota, not a code defect) |
 | 3.4 | Graceful fallback: return retrieved chunks directly (same `{ answer, sources }` shape) when Gemini generation fails | **Implemented** — a reliability feature, not a new capability; see [Graceful Fallback](#graceful-fallback) |
+| 3.5 | Local observability: OpenTelemetry metrics, Prometheus, Grafana | **Implemented** — local-only; see [§13](#13-observability--monitoring) |
 | 4 | Agent / tool calling | Planned |
 | 5 | Car inventory / data | Planned |
 | 6 | Real-time availability | Planned |
@@ -851,3 +867,176 @@ Phases 4–8 are not implemented and nothing in the current codebase anticipates
 - **No `class-validator`/`ValidationPipe` for `POST /chats`:** this endpoint is the first real HTTP request body in the project, so no validation convention existed to follow yet. A single required string field didn't justify adding a new library — a small manual parser (`parseCreateChatDto`) does the same job with zero new dependencies. If a second endpoint needs richer validation later, that's the point to reconsider introducing `class-validator` project-wide.
 - **`ChatsController` as a pure pass-through:** it validates and calls `RagService.answer()` — nothing else. This keeps the HTTP layer from becoming a second place RAG behavior could drift, and matches the existing pattern of thin, single-responsibility layers (`RetrievalService` vs. `RagService`) used throughout the codebase.
 - **Separate `chat/` Next.js app rather than folding the frontend into `agentive-service/`:** the backend is a NestJS/Node API project with its own `package.json`, build, and deploy story; a Next.js app has a different one. Keeping them as sibling projects means each can be run, tested, and deployed independently, and the frontend only ever talks to the backend over HTTP — never importing backend code directly.
+- **Observability isolated in its own `MetricsModule`, not scattered through business logic:** `RagService`, `RetrievalService`, and `GeminiTextGenerationProvider` each call two or three small, semantic `MetricsService` methods (`recordRagRequest()`, `recordRetrieval()`, `recordFallback()`, `recordGeminiGeneration()`) — none of them know OpenTelemetry, Prometheus, or a metric name exists. All instrument/label/naming decisions live in one file (`src/metrics/metrics.service.ts`), so the metrics backend could be swapped without touching RAG code, and the RAG code stays readable on its own.
+- **The Prometheus exporter never runs its own HTTP server:** `PrometheusExporter` is constructed with `preventServerStart: true` and its request handler is wired to `GET /metrics` on the same NestJS port instead, via Nest's own DI (`MeterProvider`/`PrometheusExporter` as regular providers) rather than OpenTelemetry's global-singleton API — this sidesteps an initialization-order hazard (the global metrics API has no proxy layer, so a `Meter` obtained before the real provider is registered would stay a no-op forever) and keeps "one process, one port" for local dev.
+- **`http_requests_total`/`http_request_duration_seconds` are recorded on the response's `finish` event, not in an RxJS `tap`/`catchError`:** NestJS's exception filters (which set the final status code for thrown errors) run *after* interceptors, so reading `response.statusCode` from inside the interceptor's own success/error callbacks would see the wrong code for error responses. Listening for `finish` guarantees the true status code on every path.
+- **Gemini error classification is a fixed 5-value enum (`quota`/`server`/`network`/`timeout`/`unknown`), never the raw error message:** keeps the `error_type` metric label's cardinality constant regardless of how many different underlying error strings Gemini or the network ever produces, per the explicit "logs vs. metrics" distinction in [§13](#13-observability--monitoring).
+
+## 13. Observability & Monitoring
+
+### Monitoring architecture
+
+```
+NestJS Agentive Service
+        ↓
+OpenTelemetry (Meter / Counter / Histogram instruments, in-process)
+        ↓
+Prometheus (scrapes GET /metrics on the app's own port, every 5s)
+        ↓
+Grafana (Prometheus configured as its datasource; a dashboard visualizes it)
+```
+
+The application exposes metrics; it does **not** push anything to, call, or import Grafana. Grafana only ever talks to Prometheus. Concretely:
+
+- **OpenTelemetry** lives entirely inside `src/metrics/` (`MetricsService`, `MetricsModule`, `MetricsController`, `HttpMetricsInterceptor`, `gemini-error-classifier.ts`). `RagService`, `RetrievalService`, and `GeminiTextGenerationProvider` each hold a `MetricsService` and call a handful of small, semantic methods (`recordRagRequest()`, `recordRetrieval()`, `recordFallback()`, `recordGeminiGeneration()`) — none of them import OpenTelemetry or know Prometheus exists.
+- **Prometheus** is a new service in `docker-compose.yml`, configured by `monitoring/prometheus/prometheus.yml` to scrape `GET /metrics` on the NestJS app.
+- **Grafana** is a new service in `docker-compose.yml`, with its Prometheus datasource and the dashboard below auto-provisioned from `monitoring/grafana/provisioning/` and `monitoring/grafana/dashboards/` — no manual setup required after `docker compose up -d`.
+- The NestJS app itself is **not** added to `docker-compose.yml` — it keeps running on the host via the existing `npm run start:dev` workflow (default port `3000`), matching how the rest of this project already runs locally.
+
+### What we monitor
+
+| Area | What's tracked |
+|---|---|
+| HTTP | Total requests, latency, and status codes for every route (method + route + status_code dimensions) |
+| RAG retrieval | Total RAG requests, Qdrant retrieval latency, number of chunks retrieved, empty retrievals |
+| Gemini generation | Total/successful/failed generation calls, latency, and failures specifically caused by rate-limit/quota exhaustion (HTTP 429) |
+| Fallback | How often `RagService` returns the retrieved chunks directly because Gemini generation failed |
+
+### Metrics reference
+
+All instruments live in `src/metrics/metrics.service.ts`. Every label is one of a small, fixed set of values — never a user question, raw error message, or request id (see [Logs vs. metrics](#logs-vs-metrics) below).
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `http_requests_total` | Counter | `method`, `route`, `status_code` | Every HTTP request received |
+| `http_request_duration_seconds` | Histogram | `method`, `route`, `status_code` | HTTP request latency |
+| `rag_requests_total` | Counter | — | Every call to `RagService.answer()` |
+| `rag_retrieval_duration_seconds` | Histogram | — | Duration of the Qdrant retrieval step |
+| `rag_retrieval_results` | Histogram | — | Number of chunks returned per retrieval |
+| `rag_retrieval_empty_total` | Counter | — | Retrievals that returned zero chunks |
+| `rag_fallback_total` | Counter | — | Answers served via the retrieval-only fallback because Gemini generation failed |
+| `gemini_generation_requests_total` | Counter | `provider`, `model` | Every attempted Gemini generation call |
+| `gemini_generation_success_total` | Counter | `provider`, `model` | Successful Gemini generation calls |
+| `gemini_generation_failure_total` | Counter | `provider`, `model`, `error_type` | Failed Gemini generation calls |
+| `gemini_generation_429_total` | Counter | `provider`, `model` | Failures specifically classified as `error_type="quota"` (HTTP 429) |
+| `gemini_generation_duration_seconds` | Histogram | `provider`, `model`, `outcome` | Gemini generation latency |
+
+`error_type` is always one of exactly five values, computed by `classifyGeminiError()` (`src/metrics/gemini-error-classifier.ts`) from the error's HTTP status/cause — never its message text:
+
+| `error_type` | When |
+|---|---|
+| `quota` | HTTP 429 (the real failure this project has hit: `RESOURCE_EXHAUSTED` / `generate_content_free_tier_requests`) |
+| `server` | HTTP 5xx |
+| `network` | `fetch failed` / `ECONNREFUSED` / `ENOTFOUND` / `ECONNRESET` |
+| `timeout` | `AbortError` / `ETIMEDOUT` |
+| `unknown` | anything else (e.g. an invalid API key, an invalid model name — both verified live below) |
+
+### How to start
+
+```bash
+cd agentive-service
+docker compose up -d      # Qdrant + Prometheus + Grafana
+npm run start:dev         # the NestJS app itself, on http://localhost:3000
+```
+
+`docker compose up -d` now starts three containers (previously just Qdrant):
+
+```
+Docker Compose
+│
+├── Qdrant       (localhost:6333 / 6334)
+├── Prometheus   (localhost:9090)
+└── Grafana      (localhost:3002)
+```
+
+### How to check metrics
+
+```bash
+curl http://localhost:3000/metrics
+```
+
+Returns the current OpenTelemetry state in plain Prometheus text format (this is the same NestJS process/port as the rest of the API — no separate exporter process to run).
+
+### How to view Prometheus
+
+Open **http://localhost:9090**. Under **Status → Targets**, the `agentive-service` job should show `State: UP`, scraping `http://host.docker.internal:3000/metrics` every 5 seconds. Under **Graph**, run any of the queries below.
+
+### How to view Grafana
+
+Open **http://localhost:3002** — login `admin` / `admin` (local dev only; you'll be prompted to change it, which you can skip). The **Prometheus** datasource and the **Agentive Service** dashboard are both already there — no manual setup. Open the dashboard and you'll see four rows: **Overview**, **Rates**, **Latency (p95)**, and **Errors**, covering every metric in the table above.
+
+### How to trigger a test
+
+```bash
+curl -X POST http://localhost:3000/chats \
+  -H "Content-Type: application/json" \
+  -d '{"message":"How much is the security deposit?"}'
+```
+
+After it returns, within a few seconds (Prometheus's 5s scrape interval) you should see, both in Prometheus (`sum(rag_requests_total)`, etc.) and on the Grafana dashboard:
+
+- `http_requests_total{method="POST",route="/chats",status_code="200"}` **+1**
+- `rag_requests_total` **+1**
+- `rag_retrieval_duration_seconds` and `rag_retrieval_results` gain one more observation (3 chunks, by default)
+- `gemini_generation_requests_total` and `gemini_generation_success_total` **+1** (assuming Gemini succeeds)
+
+### The 429 / quota → fallback → HTTP 200 test
+
+Because this project's Gemini key is on the free tier (20 generation requests/day for `gemini-3.6-flash`), a request can genuinely hit the real quota limit:
+
+```
+Gemini generation → 429 RESOURCE_EXHAUSTED
+                    ↓
+                 RagService catches it, classifies error_type="quota"
+                    ↓
+              rag_fallback_total +1, gemini_generation_429_total +1
+                    ↓
+                 HTTP 200 (retrieved chunks returned as the answer)
+```
+
+When this happens (you cannot force it on demand — it depends on how much of today's quota is already used), the exact same `curl` command above will instead show:
+
+- `gemini_generation_failure_total{error_type="quota"}` **+1**
+- `gemini_generation_429_total` **+1**
+- `rag_fallback_total` **+1**
+- `http_requests_total{status_code="200"}` **+1** — still 200, not 500
+
+Do not claim or expect a fixed number here — it depends entirely on how much of the day's quota has already been used by the time you test.
+
+**What was actually verified in this implementation session**, since the quota happened to be fresh (not exhausted) at the time: the success path above was verified live with 3 real `POST /chats` calls, all returning real Gemini-generated answers with `http_requests_total`, `rag_requests_total`, `gemini_generation_requests_total`, and `gemini_generation_success_total` all incrementing correctly, and `gemini_generation_duration_seconds` recording real latencies. The **failure → fallback → HTTP 200** path was verified live too, using a real (not simulated) Gemini API error — a temporary, throwaway server instance was pointed at an invalid `GEMINI_GENERATION_MODEL` (a real 404 from Gemini's API, at zero cost to the real quota — a deliberately *invalid API key* was also tried first, but that fails at the *embedding* step instead, since embeddings and generation share one key, which is itself useful confirmation that retrieval failures correctly do **not** trigger the fallback). That test produced, for real: `rag_fallback_total` **+1**, `gemini_generation_failure_total{error_type="unknown"}` **+1**, and `http_requests_total{status_code="200"}` **+1** — proving the entire mechanism end-to-end. The specific `error_type="quota"` classification for a real 429 is additionally covered by unit tests using the exact error shape (`{ status: 429 }`) captured from this project's own real 429 response in an earlier session.
+
+### Example PromQL queries
+
+```promql
+# Instant totals
+sum(gemini_generation_requests_total)
+sum(gemini_generation_failure_total)
+sum(gemini_generation_429_total)
+sum(rag_fallback_total)
+
+# Rates over time (5-minute windows)
+rate(gemini_generation_requests_total[5m])
+sum(rate(gemini_generation_success_total[5m]))
+sum(rate(gemini_generation_failure_total[5m]))
+sum(rate(rag_fallback_total[5m]))
+
+# Non-quota Gemini failures only
+sum(rate(gemini_generation_failure_total{error_type!="quota"}[5m])) by (error_type)
+
+# p95 latency
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(rag_retrieval_duration_seconds_bucket[5m])) by (le))
+histogram_quantile(0.95, sum(rate(gemini_generation_duration_seconds_bucket[5m])) by (le))
+
+# HTTP error rates
+sum(rate(http_requests_total{status_code=~"4.."}[5m]))
+sum(rate(http_requests_total{status_code=~"5.."}[5m]))
+```
+
+### Logs vs. metrics
+
+Metrics (this section) answer *how many, how often, how long, what percentage* — they're what Prometheus stores and Grafana graphs. They deliberately do **not** answer *what exactly happened*: no user question, no raw error message, and no request id appears in any metric or label above — only the fixed, small label sets in the reference table. Logs (`Logger.warn` calls already in `RagService`/elsewhere, printed to stdout) are where the actual error text and request-level detail belong, and are unchanged by this work. If request ids or distributed tracing are introduced later, they belong in logs/traces, not metric labels, for the same cardinality reason.
+
+### What this does not include
+
+Per this step's explicit scope: no Kubernetes, no cloud monitoring backend (CloudWatch/Datadog/New Relic), no ELK/Loki, no distributed tracing (Tempo or otherwise). This is local-only observability (OpenTelemetry → Prometheus → Grafana); production observability is a separate, later concern.

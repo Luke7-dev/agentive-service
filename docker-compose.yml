@@ -1,4 +1,9 @@
 # Local development only — no auth, no production config.
+#
+# The NestJS app itself is NOT in this compose file — it keeps running on the
+# host via `npm run start:dev` (existing workflow), on port 3000 by default.
+# Prometheus (inside Docker) scrapes it at host.docker.internal:3000/metrics —
+# see monitoring/prometheus/prometheus.yml if that port ever changes.
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -8,5 +13,35 @@ services:
     volumes:
       - qdrant_storage:/qdrant/storage
 
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    # Lets `host.docker.internal` resolve on Linux too (already automatic on
+    # Docker Desktop for macOS/Windows) so Prometheus can reach the NestJS
+    # app running on the host.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - '3002:3000' # host 3002 — 3000 is the NestJS app, 3001 is commonly taken by other local projects
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+    environment:
+      # Local dev only — do not reuse these defaults anywhere else.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
+
 volumes:
   qdrant_storage:
+  prometheus_data:
+  grafana_data:

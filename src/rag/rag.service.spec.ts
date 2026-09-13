@@ -1,8 +1,22 @@
 import { describe, expect, it } from 'vitest';
+import type { MetricsService } from '../metrics/metrics.service.js';
 import type { RetrievedKnowledgeChunk, SearchOptions } from '../retrieval/retrieval.interface.js';
 import type { RetrievalService } from '../retrieval/retrieval.service.js';
 import { RagService } from './rag.service.js';
 import type { TextGenerationProvider } from './text-generation-provider.interface.js';
+
+class FakeMetricsService {
+  ragRequestCount = 0;
+  fallbackCount = 0;
+
+  recordRagRequest(): void {
+    this.ragRequestCount++;
+  }
+
+  recordFallback(): void {
+    this.fallbackCount++;
+  }
+}
 
 class FakeRetrievalService {
   searchCalls: Array<{ query: string; options?: SearchOptions }> = [];
@@ -51,10 +65,12 @@ function makeChunk(
 }
 
 function makeService(retrieval: FakeRetrievalService, generation: FakeTextGenerationProvider = new FakeTextGenerationProvider()) {
+  const metrics = new FakeMetricsService();
   return {
-    service: new RagService(retrieval as unknown as RetrievalService, generation),
+    service: new RagService(retrieval as unknown as RetrievalService, generation, metrics as unknown as MetricsService),
     retrieval,
     generation,
+    metrics,
   };
 }
 
@@ -218,7 +234,12 @@ describe('RagService', () => {
         return Promise.reject('quota exceeded');
       }
     }
-    const service = new RagService(retrieval as unknown as RetrievalService, new RejectsNonError());
+    const metrics = new FakeMetricsService();
+    const service = new RagService(
+      retrieval as unknown as RetrievalService,
+      new RejectsNonError(),
+      metrics as unknown as MetricsService,
+    );
 
     const result = await service.answer('How much is the security deposit?');
 
@@ -233,5 +254,50 @@ describe('RagService', () => {
     const { service } = makeService(retrieval);
 
     await expect(service.answer('')).rejects.toThrow(/empty or invalid query/);
+  });
+
+  it('records a RAG request for every call to answer(), regardless of outcome', async () => {
+    const retrieval = new FakeRetrievalService();
+    retrieval.results = [makeChunk()];
+    const { service, metrics } = makeService(retrieval);
+
+    await service.answer('How much is the security deposit?');
+
+    expect(metrics.ragRequestCount).toBe(1);
+    expect(metrics.fallbackCount).toBe(0);
+  });
+
+  it('records a RAG request but no fallback for the empty-retrieval "not enough information" path', async () => {
+    const retrieval = new FakeRetrievalService();
+    retrieval.results = [];
+    const { service, metrics } = makeService(retrieval);
+
+    await service.answer('Do you rent spaceships?');
+
+    expect(metrics.ragRequestCount).toBe(1);
+    expect(metrics.fallbackCount).toBe(0);
+  });
+
+  it('records a fallback when generation fails', async () => {
+    const retrieval = new FakeRetrievalService();
+    retrieval.results = [makeChunk()];
+    const generation = new FakeTextGenerationProvider();
+    generation.error = new Error('Gemini is unavailable');
+    const { service, metrics } = makeService(retrieval, generation);
+
+    await service.answer('How much is the security deposit?');
+
+    expect(metrics.ragRequestCount).toBe(1);
+    expect(metrics.fallbackCount).toBe(1);
+  });
+
+  it('does not record a fallback when generation succeeds', async () => {
+    const retrieval = new FakeRetrievalService();
+    retrieval.results = [makeChunk()];
+    const { service, metrics } = makeService(retrieval);
+
+    await service.answer('How much is the security deposit?');
+
+    expect(metrics.fallbackCount).toBe(0);
   });
 });
