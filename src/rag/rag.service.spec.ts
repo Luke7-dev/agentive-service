@@ -164,14 +164,65 @@ describe('RagService', () => {
     expect(generation.prompts).toHaveLength(0);
   });
 
-  it('D: propagates a generation provider error instead of swallowing it', async () => {
+  it('D: falls back to the retrieved chunks (does not throw) when generation fails', async () => {
     const retrieval = new FakeRetrievalService();
-    retrieval.results = [makeChunk()];
+    retrieval.results = [makeChunk({}, 'A refundable deposit of 5,000 THB is required.')];
     const generation = new FakeTextGenerationProvider();
     generation.error = new Error('Gemini is unavailable');
     const { service } = makeService(retrieval, generation);
 
-    await expect(service.answer('How much is the security deposit?')).rejects.toThrow('Gemini is unavailable');
+    const result = await service.answer('How much is the security deposit?');
+
+    expect(result.answer).toContain('A refundable deposit of 5,000 THB is required.');
+    expect(result.answer).toContain('Payment & Security Deposit');
+  });
+
+  it('D: still returns the normal sources when falling back after a generation failure', async () => {
+    const retrieval = new FakeRetrievalService();
+    retrieval.results = [makeChunk({ section: 'Payment & Security Deposit' })];
+    const generation = new FakeTextGenerationProvider();
+    generation.error = new Error('Gemini is unavailable');
+    const { service } = makeService(retrieval, generation);
+
+    const result = await service.answer('How much is the security deposit?');
+
+    expect(result.sources).toEqual([{ source: 'car-rental-policies.pdf', section: 'Payment & Security Deposit' }]);
+  });
+
+  it('D: fallback lists every retrieved chunk, each labeled, when there are multiple', async () => {
+    const retrieval = new FakeRetrievalService();
+    retrieval.results = [
+      makeChunk({ section: 'Payment & Security Deposit' }, 'Deposit is 5,000 THB.'),
+      makeChunk(
+        { source: 'car-rental-services.pdf', section: 'Special Mobility Services' },
+        'Airport pickup is available.',
+      ),
+    ];
+    const generation = new FakeTextGenerationProvider();
+    generation.error = new Error('503 Service Unavailable');
+    const { service } = makeService(retrieval, generation);
+
+    const result = await service.answer('Tell me about deposits and airport pickup.');
+
+    expect(result.answer).toContain('[1] Payment & Security Deposit');
+    expect(result.answer).toContain('Deposit is 5,000 THB.');
+    expect(result.answer).toContain('[2] Special Mobility Services');
+    expect(result.answer).toContain('Airport pickup is available.');
+  });
+
+  it('D: does not call generate() again or throw for a non-Error rejection', async () => {
+    const retrieval = new FakeRetrievalService();
+    retrieval.results = [makeChunk({}, 'A refundable deposit of 5,000 THB is required.')];
+    class RejectsNonError implements TextGenerationProvider {
+      async generate(): Promise<string> {
+        return Promise.reject('quota exceeded');
+      }
+    }
+    const service = new RagService(retrieval as unknown as RetrievalService, new RejectsNonError());
+
+    const result = await service.answer('How much is the security deposit?');
+
+    expect(result.answer).toContain('A refundable deposit of 5,000 THB is required.');
   });
 
   it('propagates retrieval errors (e.g. invalid query) unchanged, consistent with RetrievalService', async () => {

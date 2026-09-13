@@ -1,5 +1,218 @@
 # Agentive Service — Car Rental Knowledge Pipeline
 
+## RAG Architecture
+
+This project is a **Retrieval-Augmented Generation (RAG)** system. Instead of asking an LLM to answer from whatever it happened to learn during training, every answer is grounded in this business's own PDF documents, retrieved fresh for each question:
+
+```
+PDF Knowledge Base
+  → Text Extraction
+  → Chunking
+  → Gemini Embeddings
+  → Qdrant Vector Database
+  → Similarity Retrieval
+  → Context Construction
+  → Gemini Generation
+  → Grounded Answer
+```
+
+**Why a vector database (Qdrant) is needed at all:** raw PDF text can't be searched *semantically*. A plain keyword/string search for "Can a 20 year old rent a car?" would not match the policy text "Minimum Age: Renters must be at least 21 years old" — there's no shared keyword, only shared meaning. So:
+
+- every knowledge chunk is converted into a **768-dimensional embedding vector** (a numeric representation of its meaning) via Gemini;
+- every user question is converted into a **query embedding** the same way;
+- **Qdrant** stores those vectors — plus the original chunk text and metadata — and performs a **cosine-similarity search** to find the vectors closest in meaning to the question, not just matching words;
+- the resulting handful of chunks (not the whole knowledge base) are passed to Gemini as context, so it generates an answer grounded in real, retrieved content instead of guessing.
+
+Qdrant is therefore the system's semantic index: the piece that turns "find text similar in meaning to this question" from an unsolved problem into a single API call.
+
+### A. Knowledge ingestion / indexing flow
+
+```mermaid
+flowchart TD
+    A["PDF"] --> B["Text Extraction"]
+    B --> C["Chunking"]
+    C --> D["Gemini Embedding\n(RETRIEVAL_DOCUMENT)"]
+    D --> E[("Qdrant\n(Vector Storage)")]
+```
+
+### B. Query / RAG answer flow (with graceful fallback)
+
+```mermaid
+flowchart TD
+    Q["User Question"] --> R["Gemini Query Embedding\n(RETRIEVAL_QUERY)"]
+    R --> S[("Qdrant Similarity Search")]
+    S --> T["Top-K Relevant\nKnowledge Chunks"]
+    T --> U["Context Construction"]
+    U --> G{"Gemini Generation"}
+    G -->|"Success"| V["Grounded Answer"]
+    G -->|"Failure"| F["Fallback to Retrieved\nKnowledge Chunks"]
+    V --> H["HTTP 200 response\n{ answer, sources }"]
+    F --> H
+```
+
+This is what `RagService.answer()` actually does today (`src/rag/rag.service.ts`). Everything up to and including "Top-K Relevant Knowledge Chunks" happens **before** Gemini generation is even attempted — Qdrant retrieval runs first, unconditionally, and the chunks are already in hand by the time generation is attempted. That ordering is what makes the fallback possible: if `TextGenerationProvider.generate()` throws (Gemini down, rate-limited, quota exhausted, or any other error), `RagService` catches it and returns those already-retrieved chunks as the answer instead of failing the request. **Gemini generation is therefore not a single point of failure for the user-facing response** — only Qdrant retrieval is on that critical path. Both branches return the exact same `{ answer, sources }` shape and the same `HTTP 200`; a caller (including the `chat/` frontend) cannot distinguish "generated" from "fallback" from the response shape alone, only by reading the `answer` text. See [Retrieval and Generation](#retrieval-and-generation) and [Graceful Fallback](#graceful-fallback) below for more detail.
+
+**`RETRIEVAL_DOCUMENT` vs. `RETRIEVAL_QUERY`:** both are Gemini embedding *task types* — a hint telling the embedding model which side of a search this text is on. Documents get indexed once and searched many times, while a query is a one-off question, so Gemini optimizes the resulting vector differently for each role. Both still produce the same 768-dimensional, directly-comparable vector space; using the matching task type on each side simply improves how well cosine similarity ranks the truly relevant chunk first (this is not theoretical here — see "Step 2.1 — Retrieval Quality Fix" in [§4](#4-step-by-step-implementation), where switching the query side from `RETRIEVAL_DOCUMENT` to `RETRIEVAL_QUERY` took the evaluation from 4/6 to 6/6).
+
+## Retrieval and Generation
+
+A core architectural point in this project: **Qdrant retrieval does not depend on Gemini text generation.** They are two separate concerns, implemented as two separate services (`RetrievalService` and `RagService`), and Gemini is currently used for two distinct, independent jobs:
+
+1. **Embeddings** — converting text (chunks at indexing time, questions at query time) into vectors.
+2. **Answer generation** — turning retrieved chunks into a natural-language answer.
+
+**Retrieval** works like this:
+
+- The user's question is converted into a vector (an **embedding**) — a numeric representation of what the question *means*, not its literal words.
+- **Qdrant** performs a **semantic similarity search**: it compares that vector against every stored chunk vector and finds the ones closest in meaning.
+- The result is a **ranked list of relevant knowledge chunks** — real, verbatim text from the source PDFs, each with a similarity score.
+
+**Generation** is a separate step layered on top of that result:
+
+- **Gemini** receives the user's question plus the retrieved chunks as context, and generates a natural-language answer grounded in that context.
+- If generation is unavailable — the Gemini API is down, rate-limited, or errors — **the retrieved chunks themselves are still valid, grounded knowledge**, and `RagService` returns them directly instead of an LLM-written answer, without inventing anything and without failing the request. See [Graceful Fallback](#graceful-fallback) below for exactly how this works — **this fallback is implemented** (see "Step 3.1 — RAG Answer Generation" in [§4](#4-step-by-step-implementation)); retrieval failures are unaffected and still propagate normally.
+
+**Qdrant's role, in short** (full detail under "Step 1.4 — Qdrant Storage" in [§4](#4-step-by-step-implementation)):
+
+| | |
+|---|---|
+| Collection | `car_rental_knowledge` |
+| Vector dimensions | `768` |
+| Distance metric | `Cosine` |
+| Payload fields | `text`, `source`, `section`, `documentTitle`, `page`, `chunkIndex`, `chunkId` |
+| Point IDs | Deterministic UUIDv5, derived from `KnowledgeChunk.id` — makes re-indexing idempotent |
+
+This separation is what makes the RAG pipeline able to survive a generation outage: retrieval never calls Gemini's generation API and has no code path that depends on it succeeding — which is exactly why `RagService` can fall back to the retrieved chunks when generation fails (see [Graceful Fallback](#graceful-fallback)) without needing any change to retrieval itself.
+
+## Graceful Fallback
+
+> **Status: implemented.** `RagService.answer()` (`src/rag/rag.service.ts`) wraps the call to `TextGenerationProvider.generate()` in a `try`/`catch`. On failure it logs a warning (`this.logger.warn(...)`, server-side only) and returns the already-retrieved chunks, formatted as a readable answer via `buildFallbackAnswer()`, instead of letting the error fail the request. Covered by tests in `src/rag/rag.service.spec.ts` ("falls back to the retrieved chunks (does not throw) when generation fails", plus tests for sources, multiple chunks, and non-`Error` rejections).
+
+**Normal flow:**
+```
+User Question
+→ Retrieval
+→ Relevant Chunks
+→ Gemini
+→ Final Answer
+```
+
+**Fallback flow:**
+```
+User Question
+→ Retrieval
+→ Relevant Chunks
+→ Gemini unavailable
+→ Show Relevant Chunks
+```
+
+Instead of an error, the fallback returns the retrieved chunks directly. This is a real, live-captured example — the `answer` field of an actual `POST /chats` response, made while this project's Gemini key had exhausted its free-tier daily generation quota:
+
+```
+I couldn't generate a written answer right now, but here is the relevant information from our knowledge base:
+
+[1] Payment & Security Deposit
+2. Payment & Security Deposit
+● Accepted Payment Methods: Credit Card (Visa, Mastercard), Bank Transfer, or
+PromptPay.
+● Security Deposit: A refundable deposit of 5,000 THB (Standard/Economy/SUV) or
+10,000 THB (Luxury) is required upon vehicle handover.
+● Deposit Refund: Refunded within 3–7 business days after vehicle inspection upon
+return, provided there is no damage or unpaid traffic fines.
+
+[2] Insurance & Damage Policy
+3. Insurance & Damage Policy
+● Standard Protection Included: Basic Third-Party Liability and Collision Damage Waiver
+(CDW) with a standard excess amount (deductible).
+● Excess Liability: Renter is responsible for damage up to the excess limit (e.g., max 5,000
+THB) per incident under CDW.
+● Full Coverage Add-on (Super CDW): Optional coverage to reduce the damage excess to
+0 THB (does not cover lost keys, interior damage, or tire/glass damage caused by
+negligence).
+
+[3] Cancellation & Modification Policy
+4. Cancellation & Modification Policy
+● Free Cancellation: Up to 48 hours prior to the scheduled pickup time for a full refund.
+● Late Cancellation: Cancellations made within 24 to 48 hours of pickup will incur a charge
+equal to 1 day's rental fee.
+● No-Show / Same-Day Cancellation: Non-refundable (100% of booking fee charged).
+```
+
+The response's HTTP status was `200 OK`, and its JSON shape was the ordinary `{ answer, sources }` — identical to a normal generated answer. Each numbered entry repeats its section heading because that heading is the verbatim first line of the stored chunk text; nothing is summarized or reworded, and the chunk numbering (`[1]`, `[2]`, `[3]`) mirrors the same per-chunk labeling `RagService` already uses when building the Gemini prompt.
+
+**Two things this fallback deliberately does *not* do:**
+
+- **It does not expose the raw provider error to the customer.** Whatever Gemini returned — a `429 RESOURCE_EXHAUSTED` quota message, a network failure, an SDK exception — is logged server-side via `Logger.warn` and never appears in the response body; the customer only ever sees the retrieved knowledge or a generated answer, never an error message or stack trace.
+- **It does not touch retrieval.** A failure in `RetrievalService.search()` itself (e.g. Qdrant unreachable) is a different failure mode and still propagates as before — the fallback only applies once retrieval has already succeeded and generation is the thing that failed.
+
+**Why this is useful:**
+
+- Prevents the whole RAG experience from failing outright when the generation provider is unavailable — e.g. Gemini rate limits, outages, or quota exhaustion, a real constraint already observed with this project's free-tier key (see "Step 3.3" in [§4](#4-step-by-step-implementation), and the live example above).
+- Keeps the response grounded in the knowledge base even without generation — it's never an invented answer, just the underlying evidence shown directly.
+- Makes the retrieval layer independently useful, reinforcing that it doesn't need Gemini generation to do its job.
+- Makes it easier to replace Gemini generation with another provider later, since callers already have defined behavior for "no generation available" instead of an unhandled failure.
+- Supports a possible future local-LLM architecture, where generation might run on infrastructure that's less reliably available than the vector search itself. (No local LLM or local embedding provider exists in this codebase today — both remain future work, tracked in [§11](#11-development-roadmap).)
+
+## How RAG Works in This Project
+
+### 1. Ingest the knowledge
+The two PDF knowledge documents (`car-rental-services.pdf`, `car-rental-policies.pdf`) are extracted to plain text and split into 8 coherent chunks total, one per document section.
+
+### 2. Create document embeddings
+Each chunk is converted into a **768-dimensional** Gemini embedding (`gemini-embedding-001`) using task type **`RETRIEVAL_DOCUMENT`**.
+
+### 3. Store in Qdrant
+The vectors and chunk metadata (source, section, page, etc.) are stored in the **`car_rental_knowledge`** Qdrant collection, using **cosine** distance.
+
+### 4. Embed the user's question
+The user's question is embedded with the same model, using task type **`RETRIEVAL_QUERY`** instead.
+
+### 5. Retrieve relevant knowledge
+Qdrant performs a cosine-similarity search and returns the top-K most relevant chunks (**3** by default for the RAG flow below).
+
+### 6. Build context
+The retrieved chunks are combined into a single context block, each one labeled with its source document and section, with the original chunk text kept verbatim (never summarized or rewritten).
+
+### 7. Generate the answer
+Gemini (`gemini-3.6-flash` by default) receives the question and retrieved context in one prompt — with explicit instructions to answer only from that context and say so if it's not enough — and generates the final, grounded answer.
+
+## Try the RAG Pipeline
+
+The fastest way to see the whole thing work is these two commands, run from `agentive-service/` (see [§6](#6-configuration) for environment variables and [§7](#7-commands) for the full command list).
+
+### Index Knowledge
+
+```bash
+docker compose up -d
+npm run index:knowledge
+```
+
+Runs the full ingestion flow above: extracts and chunks both PDFs, embeds each chunk with Gemini (`RETRIEVAL_DOCUMENT`), and upserts them into the `car_rental_knowledge` Qdrant collection. Safe to re-run — indexing is idempotent (see "Step 1.4 — Qdrant Storage" in [§4](#4-step-by-step-implementation)).
+
+### Ask a Question
+
+```bash
+npm run ask:knowledge -- "How much is the security deposit?"
+```
+
+Runs the full retrieval + generation flow above and prints a grounded answer with its sources:
+
+```
+Question:
+How much is the security deposit?
+
+Answer:
+The security deposit is 5,000 THB for Standard, Economy, and SUV vehicles, or 10,000 THB
+for Luxury vehicles. This deposit is refundable upon vehicle handover and inspection.
+
+Sources:
+- car-rental-policies.pdf — Payment & Security Deposit
+```
+
+If Gemini generation is unavailable when you run this (e.g. rate-limited or out of quota), the same command still succeeds — `Answer:` shows the retrieved chunks directly instead of an error. See [Graceful Fallback](#graceful-fallback) for details and a real captured example.
+
+The full, numbered documentation below ([§1](#1-project-overview) onward) goes into implementation-level detail on every step summarized above.
+
 ## 1. Project Overview
 
 **Agentive Service** is the backend for a car-rental AI agent, built with NestJS. The system's eventual goal is a conversational agent that can answer customer questions about a car rental business and, later, take actions on their behalf (search cars, check availability, book, pay).
@@ -14,6 +227,7 @@ Building that agent well requires it to ground its answers in the business's rea
 - Storage and indexing of embeddings in Qdrant
 - Semantic similarity search: given a question, retrieve the most relevant chunks
 - Basic RAG answer generation: turning retrieved chunks into a grounded, natural-language answer via Gemini
+- Graceful fallback: if Gemini generation fails, `RagService` returns the already-retrieved knowledge chunks directly instead of an error, keeping the same `{ answer, sources }` shape (see [Graceful Fallback](#graceful-fallback))
 - A stateless HTTP chat endpoint (`POST /chats`) exposing `RagService` to callers
 - A simple Next.js chat frontend (`chat/`, sibling to this service) that calls that endpoint
 
@@ -23,6 +237,7 @@ Building that agent well requires it to ground its answers in the business's rea
 - Any car inventory, availability, booking, or payment functionality
 - Conversation memory or multi-turn context — each `POST /chats` call is answered independently, with no chat history stored or referenced
 - Authentication of any kind on the chat endpoint or frontend
+- A local (self-hosted) embedding provider or a local LLM for generation — both remain Gemini-only today; swapping either is possible via the existing provider interfaces but has not been done
 
 Everything below documents what is actually implemented, verified against the current source tree — not the eventual vision.
 
@@ -305,10 +520,11 @@ interface TextGenerationProvider {
     <question>
     ```
 
-  4. Sends the prompt to `TextGenerationProvider.generate()` and returns `{ answer, sources }`, where `sources` is a minimal, de-duplicated `{ source, section? }[]` — no chunk ids, scores, or vectors exposed.
-- **Separation of concerns kept intact:** generation logic lives entirely in `RagService`/`GeminiTextGenerationProvider` — `RetrievalService` was not modified.
-- **No HTTP controller yet** — `RagService` is called from `npm run ask:knowledge` (see [§7](#7-commands)) and via NestJS DI, same as the retrieval layer before it.
-- **Verified against the live pipeline:** manually exercised with `npm run ask:knowledge` against the real indexed Qdrant collection and Gemini API — e.g. asking "How much is the security deposit?" returns a grounded answer citing "Payment & Security Deposit", and an out-of-scope question ("Do you sell spaceships?") correctly gets a "not enough information" style answer instead of a fabricated one.
+  4. Sends the prompt to `TextGenerationProvider.generate()`. **If it succeeds**, returns `{ answer, sources }` with the generated text, where `sources` is a minimal, de-duplicated `{ source, section? }[]` — no chunk ids, scores, or vectors exposed.
+  5. **If `generate()` throws** (Gemini down, rate-limited, quota exhausted, or any other error) — `RagService` catches it, logs a warning server-side, and returns `{ answer, sources }` anyway: `answer` is the same retrieved chunks formatted as a readable list (`buildFallbackAnswer()`), and `sources` is the same as the success case. See [Graceful Fallback](#graceful-fallback) for the full behavior, a real captured example, and why it's implemented this way.
+- **Separation of concerns kept intact:** generation logic (including the fallback) lives entirely in `RagService`/`GeminiTextGenerationProvider` — `RetrievalService` was not modified, and a retrieval failure (step 1) still propagates normally rather than falling back.
+- **No HTTP controller yet** — `RagService` is called from `npm run ask:knowledge` (see [§7](#7-commands)) and via NestJS DI, same as the retrieval layer before it. *(Superseded by Step 3.2 below, which adds `POST /chats`.)*
+- **Verified against the live pipeline:** manually exercised with `npm run ask:knowledge` against the real indexed Qdrant collection and Gemini API — e.g. asking "How much is the security deposit?" returns a grounded answer citing "Payment & Security Deposit", and an out-of-scope question ("Do you sell spaceships?") correctly gets a "not enough information" style answer instead of a fabricated one. The fallback path was separately verified live via `POST /chats` while the configured Gemini key's daily quota was exhausted — see the captured example in [Graceful Fallback](#graceful-fallback).
 
 ### Step 3.2 — Chat HTTP API & Next.js Frontend
 
@@ -336,6 +552,65 @@ interface TextGenerationProvider {
 - **CORS:** `src/main.ts` calls `app.enableCors({ origin: process.env.FRONTEND_URL ?? 'http://localhost:8000' })` so the local Next.js dev server (a different port) can call the API. No further CORS configuration exists.
 - **Frontend (`chat/`):** a standalone Next.js 16 + TypeScript + Tailwind app (App Router), created fresh since no frontend existed anywhere in the repository. It renders a single-page chat UI (`components/ChatInterface.tsx`) that calls `POST ${NEXT_PUBLIC_API_URL}/chats` via a small client (`lib/api.ts`) and renders whatever `{ answer, sources }` comes back — it does not call Qdrant or Gemini directly, and does not reinterpret or alter the answer. Runs on port `8000` by default (`npm run dev`/`start` in `chat/`) to avoid clashing with the backend's `3000`.
 - **Not changed:** `RetrievalService`, `EmbeddingService`, the Qdrant implementation, and the RAG prompt/logic in `RagService` are all untouched. No agent loop, tool calling, car inventory, availability, booking, payment, authentication, or conversation persistence was added.
+
+### Step 3.3 — Customer Scenario E2E Evaluation (Cypress)
+
+> Numbered 3.3 here (the request that specified this work called it "Step 3.2") to avoid a duplicate heading — §"Step 3.2" above already covers the Chat HTTP API/frontend.
+
+Cypress validates the **complete browser-to-RAG pipeline** — not just the UI, and not the API in isolation — by driving the real chat page like an actual customer for 10 representative questions.
+
+```mermaid
+flowchart TD
+    CY["Cypress"] --> UI["Next.js Chat UI"]
+    UI -->|"POST /chats"| CC["ChatsController"]
+    CC --> RS["RagService"]
+    RS --> RT["RetrievalService"]
+    RT --> QG["Qdrant + Gemini"]
+    QG --> RS
+    RS --> CC
+    CC --> UI
+    UI --> ASSERT["Cypress Assertions"]
+```
+
+- **Files:** `chat/cypress.config.ts`, `chat/cypress/e2e/customer-rag.cy.ts`, `chat/cypress/support/e2e.ts`, `chat/cypress/tsconfig.json`.
+- **No mocking:** these tests do not stub `/chats`, Gemini, or Qdrant. Every scenario exercises the real pipeline end-to-end (`Browser → Next.js → POST /chats → NestJS → RagService → RetrievalService → Qdrant → Gemini → Response → UI`), specifically to demonstrate — and catch regressions in — the working system, not a mocked stand-in for it.
+- **Selectors:** minimal `data-testid` attributes were added to `chat/components/ChatInterface.tsx` (`chat-input`, `send-button`, `user-message`, `assistant-message`, `assistant-sources`) — nothing else in the UI was changed.
+- **The 10 customer scenarios** (`customerScenarios` in the spec file), each grounded in a specific section of the knowledge base:
+
+  | # | Scenario | Grounded in | Anti-hallucination check |
+  |---|---|---|---|
+  | 1 | International Driving Permit | Driver Eligibility & Required Documents | must not claim passport + national license alone is sufficient |
+  | 2 | Airport delivery fee | Special Mobility Services | must not invent a THB fee amount |
+  | 3 | Age restriction (20 y/o) | Driver Eligibility & Required Documents | — |
+  | 4 | Payment methods | Payment & Security Deposit | must not claim cash is accepted |
+  | 5 | Cancellation & refund | Cancellation & Modification Policy | must not claim an unconditional full refund |
+  | 6 | Damage & insurance (scratch/window) | Insurance & Damage Policy | must not invent a repair price beyond the grounded 5,000/0 THB excess figures |
+  | 7 | Long-term rental discounts | Long-Term Rentals | must not invent a discount % or price |
+  | 8 | Smoking & pets | Vehicle Use Rules & Conditions | — |
+  | 9 | Late return (2 hours) | Vehicle Use Rules & Conditions | must not invent an hourly/daily THB rate |
+  | 10 | Fuel policy | Vehicle Use Rules & Conditions | must not invent a fuel fee |
+
+- **Assertion strategy:** never asserts the exact response text (LLM wording varies run to run). Instead, each scenario declares regex-based **facts that must appear** (e.g. `/promptpay/i`, `/\b21\b/`) and, where the knowledge base is silent or the scenario is a known hallucination trap, **concrete negative assertions** (e.g. "no cash-accepted claim", or a helper that extracts every `"<number> THB"` figure from the answer and fails if any of them isn't in that scenario's known-grounded set). Source sections (§6 in the task spec) are checked non-fatally for scenarios 3, 6, and 8 — if `assistant-sources` is rendered, it must mention the expected section, but the suite doesn't fail if sources happen to be empty, since the answer content is the primary signal.
+- **Waiting:** no fixed `cy.wait(...)`. The suite waits on `[data-testid="assistant-message"]` appearing, using Cypress's built-in retry (`defaultCommandTimeout` raised to 20s, and 45s specifically for that assertion) to absorb real Gemini/Qdrant latency without being flaky or artificially slow.
+- **Two ways to run it — same real pipeline, different purpose:**
+
+  ```bash
+  # Terminal 1 (agentive-service/): docker compose up -d && npm run start:dev
+  # Terminal 2 (chat/):             npm run dev
+  cd chat
+  npm run cypress:open        # interactive demo — watch it in a real browser
+  npm run cypress:run         # headless — for CI / automated evaluation
+  # (test:e2e:cypress is an alias for cypress:run)
+  ```
+
+  - **`npm run cypress:open` (interactive demo):** opens the Cypress app, pick `customer-rag.cy.ts`, and it drives an actual browser window against the real chat UI — you watch it click the input, type the real customer question, click Send, and the real assistant answer (from the real Qdrant + Gemini round trip) render on screen before the assertions run against it. Nothing about the chat UI is hidden or replaced; the Cypress command log narrates each phase (`cy.log` calls for the question, "waiting for the real RAG pipeline…", and the answer text) alongside Cypress's own auto-logged `visit`/`get`/`type`/`click` commands. Each of the 10 scenarios is its own `it()`, so you can run the whole file to watch all 10 in sequence (a fresh page load between each — this app has no chat history anyway) or click a single scenario in the sidebar to demo just that one. A short (1.5s) pause after each scenario's answer appears — skipped automatically in headless mode via `Cypress.config('isInteractive')` — just gives a human watching enough time to read the Q&A before the next scenario reloads the page; it is not the synchronization mechanism, which is still the `cy.get(...)` retry on `[data-testid="assistant-message"]`.
+  - **`npm run cypress:run` (headless evaluation):** identical test code, same real backend calls, no visible browser and no demo pause — meant for CI or a quick pass/fail check rather than watching it.
+
+  Required local services either way: Qdrant running, the NestJS backend on `:3000` with a `GEMINI_API_KEY` that has remaining quota, and the Next.js frontend on `:8000`. `baseUrl` defaults to `http://localhost:8000` and is overridable via `CYPRESS_BASE_URL` so it isn't hardcoded to one machine.
+- **What this suite does and doesn't prove:** it is a small, representative evaluation of 10 real customer questions against the live pipeline — useful for catching retrieval/prompt/generation regressions on these specific, curated cases. It does **not** prove the LLM is universally correct on arbitrary questions outside this set.
+- **Known environment constraint — Gemini free-tier daily quota:** the configured Gemini API key is on the free tier, which caps `gemini-3.6-flash` generation at **20 requests/day** (`generativelanguage.googleapis.com/generate_content_free_tier_requests`, a per-project-per-model **daily** quota — confirmed via the `429 RESOURCE_EXHAUSTED` errors logged by the backend). Because each scenario makes one real generation call, running this suite (plus any other manual testing done the same day) can exhaust the day's quota partway through a run, which surfaces as the UI's generic network-error state (`"The assistant could not answer that question."`) rather than a test or code defect. This is an external API limitation, not something fixed in code — see the actual run result below.
+
+**Actual run result (this session, against the live pipeline):** 3 of 10 scenarios completed and **passed** (International Driving Permit, Airport Delivery, Age Restriction) before the day's Gemini quota was exhausted; the remaining 7 could not obtain a generation response and timed out waiting for `[data-testid="assistant-message"]`. All 7 timeouts trace to the same `429 RESOURCE_EXHAUSTED` cause in the backend logs — **none** were content-assertion failures, so there is no evidence of a retrieval, prompt, or generation defect in the 3 scenarios that did run (all fact and negative/anti-hallucination assertions passed, including source-section checks). A direct `POST /chats` probe made while adding the interactive-demo polish (same day) confirmed the quota was **still** exhausted (`429 RESOURCE_EXHAUSTED` in the backend log at that timestamp), so the full suite was not re-run headless a second time that day — re-running it would only reproduce the same, already-confirmed external failure. Per this step's scope, no application code or assertions were changed to route around this — re-run `npm run cypress:run` once the daily quota resets (or against a paid-tier key) for a full 10/10 result.
 
 ## 5. Project Structure
 
@@ -406,6 +681,12 @@ A separate Next.js frontend lives in `chat/` (sibling to this `agentive-service/
 ```
 chat/
 ├── .env.example              # NEXT_PUBLIC_API_URL, documented
+├── cypress.config.ts          # baseUrl (CYPRESS_BASE_URL-overridable), raised command timeouts
+├── cypress/
+│   ├── e2e/
+│   │   └── customer-rag.cy.ts # Step 3.3 — 10 customer scenarios against the live pipeline
+│   ├── support/e2e.ts
+│   └── tsconfig.json           # kept separate so `cy`/`Cypress` globals don't leak into next build's typecheck
 ├── app/
 │   ├── layout.tsx
 │   ├── page.tsx               # renders <ChatInterface />
@@ -531,6 +812,7 @@ Verified against the current codebase — the system does **not** yet do any of 
 - Process payments
 - Maintain conversation memory or multi-turn context (each `POST /chats` call is stateless — no chat history is stored or referenced, on the backend or in the frontend)
 - Authenticate requests to `POST /chats` or the frontend in any way
+- Run generation on a local/self-hosted LLM, or embeddings on a local/self-hosted model — both are Gemini-only today (see [Graceful Fallback](#graceful-fallback) for why the provider abstractions make this possible later, and [§11](#11-development-roadmap) for its status)
 
 The one exception to "no HTTP API surface" is `POST /chats` (§3.2/§3.5) — a thin, stateless pass-through to the `RagService` above, added specifically so the existing pipeline could be driven from the simple Next.js frontend in `chat/` instead of only via dev scripts.
 
@@ -542,13 +824,16 @@ The one exception to "no HTTP API surface" is `POST /chats` (§3.2/§3.5) — a 
 | 2 | Retrieval (query → embedding → similarity search → chunks) | **Implemented** |
 | 3 | RAG answer generation (LLM synthesizes an answer from retrieved chunks) | **Implemented** (Step 3.1 — basic version) |
 | 3.2 | Chat HTTP API (`POST /chats`) + simple Next.js chat frontend | **Implemented** (Step 3.2 — stateless, no auth, no persistence) |
+| 3.3 | Customer scenario E2E evaluation (Cypress, real pipeline, no mocking) | **Implemented** (Step 3.3 — 10 scenarios; 3/10 verified passing this session, remainder blocked by Gemini free-tier daily quota, not a code defect) |
+| 3.4 | Graceful fallback: return retrieved chunks directly (same `{ answer, sources }` shape) when Gemini generation fails | **Implemented** — a reliability feature, not a new capability; see [Graceful Fallback](#graceful-fallback) |
 | 4 | Agent / tool calling | Planned |
 | 5 | Car inventory / data | Planned |
 | 6 | Real-time availability | Planned |
 | 7 | Booking | Planned |
 | 8 | Payment | Planned |
+| — | Local (self-hosted) embedding provider and/or local LLM for generation, as an alternative to Gemini | Planned — no timeline; the `EmbeddingProvider`/`TextGenerationProvider` interfaces exist to make this possible later, but no local implementation exists today |
 
-Phases 4–8 are not implemented and nothing in the current codebase anticipates their exact shape beyond the provider/interface abstractions described in [§12](#12-design-decisions). Phase 3.2's `ChatsController` is deliberately a thin pass-through with no awareness of agents, tools, or bookings — those remain entirely future work.
+Phases 4–8 are not implemented and nothing in the current codebase anticipates their exact shape beyond the provider/interface abstractions described in [§12](#12-design-decisions). Phase 3.2's `ChatsController` is deliberately a thin pass-through with no awareness of agents, tools, or bookings — those remain entirely future work. Conversation memory/multi-turn context is likewise not implemented (see [§10](#10-current-limitations)) and has no assigned phase yet.
 
 ## 12. Design Decisions
 
@@ -557,7 +842,8 @@ Phases 4–8 are not implemented and nothing in the current codebase anticipates
 - **Qdrant as the vector store, behind a `KnowledgeStore` interface:** Chosen for cosine-similarity search with a straightforward local Docker setup. The interface (`ensureCollection`, `indexChunks`, `search`, `getCollectionInfo`) means a different vector database could be substituted without touching chunking, embedding, or retrieval code.
 - **Deterministic IDs everywhere:** chunk IDs are derived from filename + section number; Qdrant point IDs are derived from chunk IDs via UUIDv5. No randomness anywhere in the pipeline, so the same input always produces the same output — essential for testability and for idempotent re-indexing.
 - **Idempotent indexing:** a direct consequence of deterministic point IDs — `indexChunks()` can be run repeatedly (e.g. after every deployment or content update) without accumulating duplicate points in Qdrant.
-- **Keeping retrieval separate from answer generation:** `RetrievalService` still only returns raw, scored `KnowledgeChunk`s — it has no knowledge of prompting or Gemini generation. `RagService` sits on top of it as a separate class, depending on it rather than absorbing its logic. This kept retrieval quality independently testable and evaluable (Step 2.1) before any generation step was layered on top, and keeps that property going forward.
+- **Keeping retrieval separate from answer generation:** `RetrievalService` still only returns raw, scored `KnowledgeChunk`s — it has no knowledge of prompting or Gemini generation. `RagService` sits on top of it as a separate class, depending on it rather than absorbing its logic. This kept retrieval quality independently testable and evaluable (Step 2.1) before any generation step was layered on top, and keeps that property going forward. It also means retrieval and generation fail independently — which is exactly what the implemented graceful fallback (see [Graceful Fallback](#graceful-fallback)) relies on: `RagService` returns the retrieved chunks directly whenever generation fails, with no change needed to `RetrievalService` itself.
+- **Fallback never leaks the raw provider error:** when `TextGenerationProvider.generate()` throws, `RagService` logs the error server-side (`Logger.warn`) but the customer-facing `answer` never contains Gemini's raw error text (e.g. a `429 RESOURCE_EXHAUSTED` message) — only the retrieved knowledge, or a generic fallback framing sentence.
 - **Provider abstraction for text generation (`TextGenerationProvider`), mirroring `EmbeddingProvider`:** `RagService` depends on the interface (via the `TEXT_GENERATION_PROVIDER` token), not on `GeminiTextGenerationProvider` directly, for the same swappability reason as embeddings — and for consistency with the rest of the codebase's provider pattern.
 - **One Gemini API key for both embeddings and generation:** `GeminiTextGenerationProvider` reads the same `GEMINI_API_KEY` as `GeminiEmbeddingProvider` instead of introducing a second credential to configure and keep in sync.
 - **No LLM call on empty retrieval results:** if `RetrievalService` finds zero chunks, `RagService` returns a fixed "not enough information" answer directly instead of prompting Gemini with an empty context — deterministic, cheaper, and removes one source of potential hallucination.
