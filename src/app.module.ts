@@ -11,6 +11,7 @@ import { RagModule } from './rag/rag.module.js';
 import { ChatsModule } from './chats/chats.module.js';
 import { MetricsModule } from './metrics/metrics.module.js';
 import { HttpMetricsInterceptor } from './metrics/http-metrics.interceptor.js';
+import { HealthModule } from './health/health.module.js';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { HttpMetricsInterceptor } from './metrics/http-metrics.interceptor.js';
     RetrievalModule,
     RagModule,
     ChatsModule,
+    HealthModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_INTERCEPTOR, useClass: HttpMetricsInterceptor }],

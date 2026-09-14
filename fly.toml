@@ -1,0 +1,23 @@
+# Minimal Fly.io config for the NestJS Agentive Service.
+# Not yet used to deploy — `fly launch`/`fly deploy` have not been run.
+# `app` and `primary_region` are placeholders; set them for real when this
+# app is actually registered on Fly (e.g. via `fly apps create`).
+app = "agentive-service"
+primary_region = "sin"
+
+[build]
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    protocol = "http"
+    grace_period = "10s"
+    interval = "30s"
+    timeout = "5s"
