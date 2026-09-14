@@ -28,9 +28,12 @@ export class QdrantKnowledgeStoreService implements KnowledgeStore {
   constructor(private readonly embeddingService: EmbeddingService) {
     this.url = process.env.QDRANT_URL?.trim() || DEFAULT_URL;
     this.collectionName = process.env.QDRANT_COLLECTION?.trim() || DEFAULT_COLLECTION;
+    const apiKey = process.env.QDRANT_API_KEY?.trim() || undefined;
     // checkCompatibility fires a background version-check request on construction;
     // disabled so building this service never depends on Qdrant already being up.
-    this.client = new QdrantClient({ url: this.url, checkCompatibility: false });
+    // apiKey is only included when set, so local unauthenticated Qdrant (no
+    // QDRANT_API_KEY) is passed the exact same config object as before.
+    this.client = new QdrantClient({ url: this.url, checkCompatibility: false, ...(apiKey ? { apiKey } : {}) });
   }
 
   private get vectorSize(): number {

@@ -8,9 +8,13 @@ const createCollectionMock = vi.fn();
 const getCollectionMock = vi.fn();
 const upsertMock = vi.fn();
 const queryMock = vi.fn();
+const qdrantClientConstructorMock = vi.fn();
 
 vi.mock('@qdrant/js-client-rest', () => {
   class FakeQdrantClient {
+    constructor(options: unknown) {
+      qdrantClientConstructorMock(options);
+    }
     collectionExists = collectionExistsMock;
     createCollection = createCollectionMock;
     getCollection = getCollectionMock;
@@ -62,11 +66,64 @@ describe('QdrantKnowledgeStoreService', () => {
     getCollectionMock.mockReset();
     upsertMock.mockReset();
     queryMock.mockReset();
+    qdrantClientConstructorMock.mockReset();
     process.env = { ...originalEnv, QDRANT_URL: 'http://localhost:6333', QDRANT_COLLECTION: 'car_rental_knowledge' };
+    delete process.env.QDRANT_API_KEY;
   });
 
   afterEach(() => {
     process.env = { ...originalEnv };
+  });
+
+  describe('QDRANT_API_KEY configuration', () => {
+    it('constructs the client without an apiKey when QDRANT_API_KEY is absent (local unauthenticated Qdrant)', () => {
+      makeService();
+
+      expect(qdrantClientConstructorMock).toHaveBeenCalledWith({
+        url: 'http://localhost:6333',
+        checkCompatibility: false,
+      });
+      const options = qdrantClientConstructorMock.mock.calls[0][0];
+      expect(options).not.toHaveProperty('apiKey');
+    });
+
+    it('constructs the client without an apiKey when QDRANT_API_KEY is an empty/whitespace string', () => {
+      process.env.QDRANT_API_KEY = '   ';
+
+      makeService();
+
+      const options = qdrantClientConstructorMock.mock.calls[0][0];
+      expect(options).not.toHaveProperty('apiKey');
+    });
+
+    it('passes QDRANT_API_KEY to the Qdrant client when set', () => {
+      process.env.QDRANT_API_KEY = 'test-qdrant-api-key';
+
+      makeService();
+
+      expect(qdrantClientConstructorMock).toHaveBeenCalledWith({
+        url: 'http://localhost:6333',
+        checkCompatibility: false,
+        apiKey: 'test-qdrant-api-key',
+      });
+    });
+
+    it('never includes the API key in a connection-failure error message', async () => {
+      process.env.QDRANT_API_KEY = 'test-qdrant-api-key';
+      const error = new TypeError('fetch failed');
+      (error as { cause?: unknown }).cause = Object.assign(new Error('ECONNREFUSED'), { code: 'ECONNREFUSED' });
+      collectionExistsMock.mockRejectedValue(error);
+
+      let thrownMessage = '';
+      try {
+        await makeService().ensureCollection();
+      } catch (thrown) {
+        thrownMessage = thrown instanceof Error ? thrown.message : String(thrown);
+      }
+
+      expect(thrownMessage).not.toBe('');
+      expect(thrownMessage).not.toContain('test-qdrant-api-key');
+    });
   });
 
   describe('ensureCollection', () => {
