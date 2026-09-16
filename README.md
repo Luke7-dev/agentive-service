@@ -1,5 +1,66 @@
 # Agentive Service — Car Rental Knowledge Pipeline
 
+## Production Deployment
+
+**Status: deployed.** This service is live in production.
+
+| | |
+|---|---|
+| Frontend | https://owel.life/ (also https://www.owel.life/) |
+| Backend API | https://api.owel.life/ |
+
+**Hosting:**
+
+| Layer | Provider |
+|---|---|
+| Frontend | Vercel (Next.js) |
+| Backend | Fly.io (this NestJS service) |
+| Vector database | Qdrant Cloud |
+| LLM / embeddings | Gemini API |
+| Domain / DNS | Namecheap |
+
+**Production architecture:**
+
+```
+User
+  ↓
+Vercel / Next.js frontend (https://owel.life, https://www.owel.life)
+  ↓ HTTPS
+https://api.owel.life
+  ↓
+Fly.io
+  ↓
+NestJS Agentive Service
+  ├── Qdrant Cloud
+  └── Gemini API
+```
+
+**Fly.io configuration** (`fly.toml`, at the project root):
+
+- Internal application port: `3000`
+- HTTPS enforced (`force_https = true`)
+- `GET /health` configured as the Fly HTTP health check (`method = "GET"`, `path = "/health"`, `protocol = "http"`, `grace_period = "10s"`, `interval = "30s"`, `timeout = "5s"`)
+- Low-cost, scale-to-zero configuration: `auto_stop_machines = "stop"`, `auto_start_machines = true`, `min_machines_running = 0`
+- Primary region: Singapore (`sin`)
+
+**CORS:** the production frontend origins (`https://owel.life` and `https://www.owel.life`) are allow-listed explicitly via the `FRONTEND_URLS` environment variable (comma-separated, exact-match only — no wildcard). See [§6](#6-configuration) and `src/cors.config.ts`.
+
+**Docker:** the backend runs from a multi-stage production Docker image — a builder stage compiles the NestJS app (`npm run build`), and a slim runtime stage runs only `node dist/main.js` with production dependencies. Local production-image testing (`docker build` + `docker run` against real Qdrant Cloud credentials) has passed. See [§7](#7-commands) for the exact commands.
+
+**Node.js version:** pinned to Node 24 LTS (`.nvmrc`, `engines.node` in `package.json`) — the same version used in the Docker image.
+
+**Monitoring stays local-only:** Prometheus and Grafana (described in [§13](#13-observability--monitoring)) are local development tooling only. They are **not** deployed to Fly.io and are **not** publicly exposed in production — production currently has no deployed metrics dashboard, only the in-process `GET /metrics` endpoint on the backend itself (unauthenticated, same as local).
+
+**Verified test/build status (this environment):**
+
+| Check | Result |
+|---|---|
+| `npm test` | 156/156 passing |
+| `npm run test:e2e` | 6/6 passing |
+| `npm run lint` | passing |
+| `npm run build` | passing |
+| Docker production build (`docker build`) | passing |
+
 ## RAG Architecture
 
 This project is a **Retrieval-Augmented Generation (RAG)** system. Instead of asking an LLM to answer from whatever it happened to learn during training, every answer is grounded in this business's own PDF documents, retrieved fresh for each question:
@@ -229,8 +290,10 @@ Building that agent well requires it to ground its answers in the business's rea
 - Basic RAG answer generation: turning retrieved chunks into a grounded, natural-language answer via Gemini
 - Graceful fallback: if Gemini generation fails, `RagService` returns the already-retrieved knowledge chunks directly instead of an error, keeping the same `{ answer, sources }` shape (see [Graceful Fallback](#graceful-fallback))
 - A stateless HTTP chat endpoint (`POST /chats`) exposing `RagService` to callers
+- A liveness/readiness endpoint (`GET /health`) that checks Qdrant connectivity via a read-only call, without touching Gemini or performing a RAG query — used as the Fly.io health check
 - A simple Next.js chat frontend (`chat/`, sibling to this service) that calls that endpoint
 - Local observability: OpenTelemetry metrics scraped by Prometheus and visualized in Grafana — see [§13](#13-observability--monitoring)
+- Production deployment: a Dockerized, Node-24-LTS-pinned production build running on Fly.io, backed by Qdrant Cloud (via `QDRANT_API_KEY`) instead of local Qdrant, with an explicit multi-origin CORS allowlist (`FRONTEND_URLS`) for the production frontend — see [Production Deployment](#production-deployment)
 
 ### What does not exist yet
 
@@ -550,7 +613,7 @@ interface TextGenerationProvider {
 - **Validation:** manual (no `class-validator`/`ValidationPipe` — this is the project's first real HTTP request body, so no such convention existed yet, and adding a validation library for one field would be more than this needs). `parseCreateChatDto()` in `dto/create-chat.dto.ts` requires `message` to be a non-empty, non-whitespace string, throwing `BadRequestException` (400) otherwise, and returns only that field — any other fields the client sends are silently ignored rather than accepted into the contract.
 - **Error handling:** the controller does not catch errors from `RagService.answer()` — they propagate to NestJS's built-in global exception filter, which already returns a generic `{ statusCode: 500, message: "Internal server error" }` without leaking stack traces or Gemini SDK internals. No custom exception filter was needed.
 - **Status code:** `200 OK` rather than Nest's REST default of `201 Created` for `POST`, since nothing is persisted — this is a stateless question/answer call, not resource creation.
-- **CORS:** `src/main.ts` calls `app.enableCors({ origin: process.env.FRONTEND_URL ?? 'http://localhost:8000' })` so the local Next.js dev server (a different port) can call the API. No further CORS configuration exists.
+- **CORS:** `src/main.ts` calls `app.enableCors({ origin: resolveAllowedOrigins() })`, where `resolveAllowedOrigins()` (`src/cors.config.ts`) resolves an **exact-match allowlist** — the comma-separated `FRONTEND_URLS` (preferred; used in production for `https://owel.life` and `https://www.owel.life`), falling back to the single `FRONTEND_URL`, falling back to the local Next.js dev default (`http://localhost:8000`). No wildcard origin is ever used. See [§6](#6-configuration).
 - **Frontend (`chat/`):** a standalone Next.js 16 + TypeScript + Tailwind app (App Router), created fresh since no frontend existed anywhere in the repository. It renders a single-page chat UI (`components/ChatInterface.tsx`) that calls `POST ${NEXT_PUBLIC_API_URL}/chats` via a small client (`lib/api.ts`) and renders whatever `{ answer, sources }` comes back — it does not call Qdrant or Gemini directly, and does not reinterpret or alter the answer. Runs on port `8000` by default (`npm run dev`/`start` in `chat/`) to avoid clashing with the backend's `3000`.
 - **Not changed:** `RetrievalService`, `EmbeddingService`, the Qdrant implementation, and the RAG prompt/logic in `RagService` are all untouched. No agent loop, tool calling, car inventory, availability, booking, payment, authentication, or conversation persistence was added.
 
@@ -618,7 +681,11 @@ flowchart TD
 ```
 agentive-service/
 ├── docker-compose.yml          # local Qdrant + Prometheus + Grafana (no auth, dev only)
-├── monitoring/                  # Prometheus + Grafana config — see §13
+├── Dockerfile                    # multi-stage production build → node dist/main.js
+├── .dockerignore
+├── fly.toml                      # Fly.io app config: port 3000, HTTPS, /health check, scale-to-zero
+├── .nvmrc                        # pinned Node LTS version (also engines.node in package.json)
+├── monitoring/                  # Prometheus + Grafana config — see §13 (local dev only, not deployed)
 │   ├── prometheus/prometheus.yml
 │   └── grafana/
 │       ├── provisioning/datasources/datasource.yml   # auto-adds the Prometheus datasource
@@ -637,7 +704,9 @@ agentive-service/
 │   ├── evaluate-retrieval.ts      # runs the 6 representative test questions
 │   └── ask-knowledge.ts           # ad-hoc RAG question → answer from the CLI
 ├── src/
-│   ├── main.ts                    # NestJS bootstrap (default scaffold)
+│   ├── main.ts                    # NestJS bootstrap — CORS via resolveAllowedOrigins(), PORT, etc.
+│   ├── cors.config.ts             # FRONTEND_URLS / FRONTEND_URL → allowed-origins list (exact match, no wildcard)
+│   ├── cors.config.spec.ts
 │   ├── app.module.ts              # wires all feature modules together
 │   ├── app.controller.ts / app.service.ts  # default Nest "Hello World" endpoint (unmodified)
 │   ├── pdf-extraction/
@@ -676,16 +745,21 @@ agentive-service/
 │   │   ├── chats.module.ts
 │   │   └── dto/
 │   │       └── create-chat.dto.ts     # CreateChatDto + manual request validation
-│   └── metrics/                        # observability — see §13, isolated from business logic
-│       ├── metrics.service.ts            # the only file that knows OpenTelemetry/Prometheus specifics
-│       ├── metrics.module.ts             # wires MeterProvider + PrometheusExporter via Nest DI
-│       ├── metrics.controller.ts         # GET /metrics
-│       ├── metrics.constants.ts          # METER_PROVIDER / PROMETHEUS_EXPORTER DI tokens
-│       ├── http-metrics.interceptor.ts   # global interceptor: http_requests_total / duration
-│       └── gemini-error-classifier.ts    # pure function: error → quota/server/network/timeout/unknown
+│   ├── metrics/                        # observability — see §13, isolated from business logic
+│   │   ├── metrics.service.ts            # the only file that knows OpenTelemetry/Prometheus specifics
+│   │   ├── metrics.module.ts             # wires MeterProvider + PrometheusExporter via Nest DI
+│   │   ├── metrics.controller.ts         # GET /metrics
+│   │   ├── metrics.constants.ts          # METER_PROVIDER / PROMETHEUS_EXPORTER DI tokens
+│   │   ├── http-metrics.interceptor.ts   # global interceptor: http_requests_total / duration
+│   │   └── gemini-error-classifier.ts    # pure function: error → quota/server/network/timeout/unknown
+│   └── health/
+│       ├── health.controller.ts       # GET /health — read-only Qdrant check, no Gemini call
+│       ├── health.controller.spec.ts
+│       └── health.module.ts
 └── test/
     ├── app.e2e-spec.ts            # e2e boot test for the default endpoint
-    └── chats.e2e-spec.ts          # e2e test for POST /chats (RagService mocked)
+    ├── chats.e2e-spec.ts          # e2e test for POST /chats (RagService mocked)
+    └── health.e2e-spec.ts         # e2e test for GET /health (KnowledgeStore mocked, no real Qdrant needed)
 ```
 
 Every `*.service.ts` above has a matching `*.spec.ts` unit test (mocked dependencies — no live Gemini/Qdrant required for `npm test`). `ChatsController` follows the same pattern.
@@ -721,10 +795,12 @@ Environment variables, as declared in `.env.example` and read in code:
 | `GEMINI_EMBEDDING_MODEL` | No | `gemini-embedding-001` | `GeminiEmbeddingProvider` |
 | `EMBEDDING_OUTPUT_DIMENSIONS` | No | `768` | `GeminiEmbeddingProvider` (also read by `QdrantKnowledgeStoreService` via `EmbeddingService.dimensions`, never duplicated) |
 | `GEMINI_GENERATION_MODEL` | No | `gemini-3.6-flash` | `GeminiTextGenerationProvider` |
-| `QDRANT_URL` | No | `http://localhost:6333` | `QdrantKnowledgeStoreService` |
+| `QDRANT_URL` | No | `http://localhost:6333` | `QdrantKnowledgeStoreService`. In production, set to the Qdrant Cloud cluster URL. |
+| `QDRANT_API_KEY` | No (required for Qdrant Cloud) | — (unset = no auth header, for local unauthenticated Qdrant) | `QdrantKnowledgeStoreService` — passed to the Qdrant client's `apiKey` option only when set, so local Docker Qdrant (no auth) is unaffected |
 | `QDRANT_COLLECTION` | No | `car_rental_knowledge` | `QdrantKnowledgeStoreService` |
-| `PORT` | No | `3000` | `src/main.ts` (default Nest HTTP listener). If you change this, also update `monitoring/prometheus/prometheus.yml`'s scrape target — see [§13](#13-observability--monitoring). |
-| `FRONTEND_URL` | No | `http://localhost:8000` | `src/main.ts` — the single origin allowed via CORS to call `POST /chats` |
+| `PORT` | No | `3000` | `src/main.ts` (default Nest HTTP listener; also the internal port Fly.io routes to). If you change this, also update `monitoring/prometheus/prometheus.yml`'s scrape target — see [§13](#13-observability--monitoring). |
+| `FRONTEND_URLS` | No | — | `src/cors.config.ts` — **preferred, production**: a comma-separated allowlist of exact origins allowed via CORS (e.g. `https://owel.life,https://www.owel.life`). Whitespace is trimmed, empty entries are ignored, matching is exact (no wildcard, no subdomain/protocol equivalence). |
+| `FRONTEND_URL` | No | `http://localhost:8000` | `src/cors.config.ts` — single-origin fallback, used only if `FRONTEND_URLS` is unset/empty. Precedence: `FRONTEND_URLS` > `FRONTEND_URL` > the `http://localhost:8000` local-dev default. |
 
 Copy `.env.example` to `.env` and fill in `GEMINI_API_KEY` before running any script that talks to Gemini or Qdrant. `.env` is git-ignored.
 
@@ -768,6 +844,24 @@ npm run build          # nest build (TypeScript compile)
 npm run lint           # oxlint over src/ and test/
 npm run start:dev      # run the Nest app in watch mode on :3000
 ```
+
+**Production Docker build** (multi-stage → `node dist/main.js`, same image used in production on Fly.io):
+```bash
+docker build -t agentive-service:local .
+docker run -p 3000:3000 \
+  -e GEMINI_API_KEY=... \
+  -e QDRANT_URL=... \
+  -e QDRANT_API_KEY=... \
+  -e FRONTEND_URLS=https://owel.life,https://www.owel.life \
+  agentive-service:local
+```
+No `.env` file is required or read inside the container — configuration is entirely via environment variables passed to `docker run` (or, in production, Fly secrets).
+
+**Fly.io** (`fly.toml` at the project root — see [Production Deployment](#production-deployment)):
+```bash
+fly config validate   # checks fly.toml against the platform, no deploy
+```
+Actual `fly launch`/`fly deploy`/`fly secrets set` are operational steps, not part of this repo's automated commands.
 
 **Running the chat frontend** (from `chat/`, a separate app — see [§5](#5-project-structure)):
 ```bash
@@ -841,7 +935,10 @@ The one exception to "no HTTP API surface" is `POST /chats` (§3.2/§3.5) — a 
 | 3.2 | Chat HTTP API (`POST /chats`) + simple Next.js chat frontend | **Implemented** (Step 3.2 — stateless, no auth, no persistence) |
 | 3.3 | Customer scenario E2E evaluation (Cypress, real pipeline, no mocking) | **Implemented** (Step 3.3 — 10 scenarios; 3/10 verified passing this session, remainder blocked by Gemini free-tier daily quota, not a code defect) |
 | 3.4 | Graceful fallback: return retrieved chunks directly (same `{ answer, sources }` shape) when Gemini generation fails | **Implemented** — a reliability feature, not a new capability; see [Graceful Fallback](#graceful-fallback) |
-| 3.5 | Local observability: OpenTelemetry metrics, Prometheus, Grafana | **Implemented** — local-only; see [§13](#13-observability--monitoring) |
+| 3.5 | Local observability: OpenTelemetry metrics, Prometheus, Grafana | **Implemented** — local-only, not deployed to production; see [§13](#13-observability--monitoring) |
+| 3.6 | `GET /health` liveness/readiness endpoint (Qdrant read-only check, no Gemini call) | **Implemented** |
+| 3.7 | Qdrant Cloud support (`QDRANT_API_KEY`), Node LTS pinning, Dockerized production build, Fly.io deployment configuration (`fly.toml`, HTTP health check, scale-to-zero) | **Implemented** — deployed to Fly.io; see [Production Deployment](#production-deployment) |
+| 3.8 | Production CORS allowlist for multiple explicit frontend origins (`FRONTEND_URLS`) | **Implemented** |
 | 4 | Agent / tool calling | Planned |
 | 5 | Car inventory / data | Planned |
 | 6 | Real-time availability | Planned |
